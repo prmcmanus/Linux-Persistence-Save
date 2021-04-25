@@ -2,12 +2,19 @@
 
 if [ "$1" == "" ]
   then
-    echo "Usage $0 /path/to/mountedUSBDrive"
+    echo "Usage $0 /path/to/mountedUSBDrive /path/to/casperPartition"
+    exit 1
+fi
+
+if [ "$2" == "" ]
+  then
+    echo "Usage $0 /path/to/mountedUSBDrive /path/to/casperPartition"
     exit 1
 fi
 
 # adding a trailing / here so we don't accidentally start with / later on
 usbpath=$1/
+casperpath=$2/
 #check for root
 #look up disk space requirements from usb and check
 #check for mksquashfs and prompt to install squashfs-tools
@@ -16,37 +23,40 @@ usbpath=$1/
 cd /var/tmp
 mkdir usblive
 cd usblive
-mkdir readonly readwrite merged
+mkdir lower merged
 echo "Mounting ${usbpath}casper/filesystem.squashfs"
-mount ${usbpath}casper/filesystem.squashfs readonly -t squashfs -o loop,ro
-
-echo "Mounting ${usbpath}casper-rw"
-mount ${usbpath}casper-rw readwrite -o loop,rw
+mount ${usbpath}casper/filesystem.squashfs lower -t squashfs -o loop,ro
 echo "Mounting overlayfs"
-mount none merged -o lowerdir=readonly,upperdir=readwrite -t overlayfs
+# mount none merged -o lowerdir=readonly,upperdir=readwrite -t overlayfs
+mount -t overlay overlay -o lowerdir=lower,upperdir=${casperpath}/upper,workdir=${casperpath}/work/work merged
 echo "Making new squashfs"
 mksquashfs merged newfilesystem.squashfs -comp xz
 
 echo "Unmounting merged, casper-rw and old squashfs"
 umount merged
-umount readwrite
-umount readonly
+umount lower
 
 echo "mounting new squashfs and making new manifest"
-mount newfilesystem.squashfs readonly -o loop,ro -t squashfs
-chroot readonly dpkg-query -W --showformat='${Package} ${Version}\n' > newfilesystem.manifest
-printf $(du -sx --block-size=1 readonly | cut -f1) > newfilesystem.size 
+mount newfilesystem.squashfs merged -o loop,ro -t squashfs
+chroot merged dpkg-query -W --showformat='${Package} ${Version}\n' > newfilesystem.manifest
+printf $(du -sx --block-size=1 merged | cut -f1) > newfilesystem.size 
 
-echo "unmounting new squashfs and copying back to usb"
-umount readonly
+echo "unmounting new squashfs"
+umount merged
 
+echo "copying new files over to USB"
 cp newfilesystem.squashfs ${usbpath}casper/filesystem.squashfs
 cp newfilesystem.size ${usbpath}casper/filesystem.size
 cp newfilesystem.manifest ${usbpath}casper/filesystem.manifest
 
-echo "resetting casper-rw"
-mkfs -t ext3 ${usbpath}casper-rw
+#echo "resetting casper-rw"
+#mkfs -t ext3 ${usbpath}casper-rw
+
+echo "resetting persistence partition"
+rm -rf ${casperpath}/upper
 
 echo "cleaning up"
 cd /var/tmp
 rm -rf usblive
+
+echo "done"
