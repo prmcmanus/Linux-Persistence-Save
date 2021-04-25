@@ -54,6 +54,7 @@ cp newfilesystem.manifest ${usbpath}casper/filesystem.manifest
 
 echo "resetting persistence partition"
 rm -rf ${casperpath}/upper
+mkdir ${casperpath}/upper
 
 echo "cleaning up"
 cd /var/tmp
