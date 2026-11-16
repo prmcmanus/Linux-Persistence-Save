@@ -1,63 +1,218 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-if [ "$1" == "" ]
-  then
-    echo "Usage $0 /path/to/mountedUSBDrive /path/to/casperPartition"
+set -Eeuo pipefail
+
+usage() {
+    echo "Usage: $0 /path/to/mountedUSBDrive /path/to/casperPartition"
     exit 1
+}
+
+log() {
+    printf '%s\n' "$*"
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ $# -ne 2 ]]; then
+    usage
 fi
 
-if [ "$2" == "" ]
-  then
-    echo "Usage $0 /path/to/mountedUSBDrive /path/to/casperPartition"
-    exit 1
+if [[ $EUID -ne 0 ]]; then
+    die "This script must be run as root. Try: sudo $0 \"$1\" \"$2\""
 fi
 
-# adding a trailing / here so we don't accidentally start with / later on
-usbpath=$1/
-casperpath=$2/
-#check for root
-#look up disk space requirements from usb and check
-#check for mksquashfs and prompt to install squashfs-tools
-#option for making safer by copying from usb 1st to make a backup
+USB_PATH="${1%/}"
+CASPER_PATH="${2%/}"
 
-cd /var/tmp
-mkdir usblive
-cd usblive
-mkdir lower merged
-echo "Mounting ${usbpath}casper/filesystem.squashfs"
-mount ${usbpath}casper/filesystem.squashfs lower -t squashfs -o loop,ro
-echo "Mounting overlayfs"
-# mount none merged -o lowerdir=readonly,upperdir=readwrite -t overlayfs
-mount -t overlay overlay -o lowerdir=lower,upperdir=${casperpath}/upper,workdir=${casperpath}/work/work merged
-echo "Making new squashfs"
-mksquashfs merged newfilesystem.squashfs -comp xz
+SOURCE_SQUASHFS="$USB_PATH/casper/filesystem.squashfs"
+TARGET_DIRECTORY="$USB_PATH/casper"
+PERSISTENCE_UPPER="$CASPER_PATH/upper"
+PERSISTENCE_WORK="$CASPER_PATH/work"
 
-echo "Unmounting merged, casper-rw and old squashfs"
-umount merged
-umount lower
+[[ -d "$USB_PATH" ]] ||
+    die "USB mount point does not exist: $USB_PATH"
 
-echo "mounting new squashfs and making new manifest"
-mount newfilesystem.squashfs merged -o loop,ro -t squashfs
-chroot merged dpkg-query -W --showformat='${Package} ${Version}\n' > newfilesystem.manifest
-printf $(du -sx --block-size=1 merged | cut -f1) > newfilesystem.size 
+[[ -d "$CASPER_PATH" ]] ||
+    die "Persistence mount point does not exist: $CASPER_PATH"
 
-echo "unmounting new squashfs"
-umount merged
+[[ -f "$SOURCE_SQUASHFS" ]] ||
+    die "Cannot find: $SOURCE_SQUASHFS"
 
-echo "copying new files over to USB"
-cp newfilesystem.squashfs ${usbpath}casper/filesystem.squashfs
-cp newfilesystem.size ${usbpath}casper/filesystem.size
-cp newfilesystem.manifest ${usbpath}casper/filesystem.manifest
+command -v mount >/dev/null 2>&1 ||
+    die "The mount command is not available"
 
-#echo "resetting casper-rw"
-#mkfs -t ext3 ${usbpath}casper-rw
+command -v mksquashfs >/dev/null 2>&1 ||
+    die "mksquashfs is not installed. Install it with: apt install squashfs-tools"
 
-echo "resetting persistence partition"
-rm -rf ${casperpath}/upper
-mkdir ${casperpath}/upper
+command -v dpkg-query >/dev/null 2>&1 ||
+    die "dpkg-query is not available"
 
-echo "cleaning up"
-cd /var/tmp
-rm -rf usblive
+TEMP_DIR="$(mktemp -d /var/tmp/usblive.XXXXXX)"
+LOWER_DIR="$TEMP_DIR/lower"
+MERGED_DIR="$TEMP_DIR/merged"
+OUTPUT_SQUASHFS="$TEMP_DIR/filesystem.squashfs"
+OUTPUT_MANIFEST="$TEMP_DIR/filesystem.manifest"
+OUTPUT_SIZE="$TEMP_DIR/filesystem.size"
 
-echo "done"
+LOWER_MOUNTED=false
+MERGED_MOUNTED=false
+NEW_SQUASHFS_MOUNTED=false
+
+cleanup() {
+    local exit_code=$?
+
+    set +e
+
+    if [[ "$MERGED_MOUNTED" == true ]] &&
+       mountpoint -q "$MERGED_DIR"; then
+        umount "$MERGED_DIR"
+    fi
+
+    if [[ "$NEW_SQUASHFS_MOUNTED" == true ]] &&
+       mountpoint -q "$MERGED_DIR"; then
+        umount "$MERGED_DIR"
+    fi
+
+    if [[ "$LOWER_MOUNTED" == true ]] &&
+       mountpoint -q "$LOWER_DIR"; then
+        umount "$LOWER_DIR"
+    fi
+
+    rm -rf -- "$TEMP_DIR"
+
+    exit "$exit_code"
+}
+
+trap cleanup EXIT INT TERM
+
+mkdir -p "$LOWER_DIR" "$MERGED_DIR"
+mkdir -p "$PERSISTENCE_UPPER" "$PERSISTENCE_WORK"
+
+# OverlayFS requires the work directory to be empty.
+find "$PERSISTENCE_WORK" -mindepth 1 -delete
+
+log "Mounting original filesystem:"
+log "  $SOURCE_SQUASHFS"
+
+mount \
+    -t squashfs \
+    -o loop,ro \
+    "$SOURCE_SQUASHFS" \
+    "$LOWER_DIR"
+
+LOWER_MOUNTED=true
+
+log "Mounting persistent overlay"
+
+mount \
+    -t overlay \
+    overlay \
+    -o "lowerdir=$LOWER_DIR,upperdir=$PERSISTENCE_UPPER,workdir=$PERSISTENCE_WORK" \
+    "$MERGED_DIR"
+
+MERGED_MOUNTED=true
+
+log "Creating new squashfs"
+
+mksquashfs \
+    "$MERGED_DIR" \
+    "$OUTPUT_SQUASHFS" \
+    -comp xz \
+    -noappend
+
+log "Creating package manifest"
+
+chroot "$MERGED_DIR" \
+    dpkg-query -W --showformat='${Package} ${Version}\n' \
+    > "$OUTPUT_MANIFEST"
+
+log "Calculating uncompressed filesystem size"
+
+du -sx --block-size=1 "$MERGED_DIR" |
+    awk '{print $1}' \
+    > "$OUTPUT_SIZE"
+
+log "Unmounting persistent overlay"
+
+umount "$MERGED_DIR"
+MERGED_MOUNTED=false
+
+log "Unmounting original squashfs"
+
+umount "$LOWER_DIR"
+LOWER_MOUNTED=false
+
+log "Checking newly created squashfs"
+
+mount \
+    -t squashfs \
+    -o loop,ro \
+    "$OUTPUT_SQUASHFS" \
+    "$MERGED_DIR"
+
+NEW_SQUASHFS_MOUNTED=true
+
+[[ -d "$MERGED_DIR/etc" ]] ||
+    die "The newly created squashfs does not contain /etc"
+
+[[ -s "$OUTPUT_MANIFEST" ]] ||
+    die "The generated package manifest is empty"
+
+[[ -s "$OUTPUT_SIZE" ]] ||
+    die "The generated filesystem size file is empty"
+
+umount "$MERGED_DIR"
+NEW_SQUASHFS_MOUNTED=false
+
+log "Backing up the existing USB metadata"
+
+cp -a \
+    "$TARGET_DIRECTORY/filesystem.squashfs" \
+    "$TARGET_DIRECTORY/filesystem.squashfs.previous"
+
+if [[ -f "$TARGET_DIRECTORY/filesystem.manifest" ]]; then
+    cp -a \
+        "$TARGET_DIRECTORY/filesystem.manifest" \
+        "$TARGET_DIRECTORY/filesystem.manifest.previous"
+fi
+
+if [[ -f "$TARGET_DIRECTORY/filesystem.size" ]]; then
+    cp -a \
+        "$TARGET_DIRECTORY/filesystem.size" \
+        "$TARGET_DIRECTORY/filesystem.size.previous"
+fi
+
+log "Copying the new filesystem to the USB"
+
+cp -- "$OUTPUT_SQUASHFS" \
+    "$TARGET_DIRECTORY/filesystem.squashfs.new"
+
+cp -- "$OUTPUT_MANIFEST" \
+    "$TARGET_DIRECTORY/filesystem.manifest.new"
+
+cp -- "$OUTPUT_SIZE" \
+    "$TARGET_DIRECTORY/filesystem.size.new"
+
+sync
+
+mv -f \
+    "$TARGET_DIRECTORY/filesystem.squashfs.new" \
+    "$TARGET_DIRECTORY/filesystem.squashfs"
+
+mv -f \
+    "$TARGET_DIRECTORY/filesystem.manifest.new" \
+    "$TARGET_DIRECTORY/filesystem.manifest"
+
+mv -f \
+    "$TARGET_DIRECTORY/filesystem.size.new" \
+    "$TARGET_DIRECTORY/filesystem.size"
+
+sync
+
+log "Resetting persistence data"
+
+find "$PERSISTENCE_UPPER" -mindepth 1 -delete
+find "$PERSISTENCE
